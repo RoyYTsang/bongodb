@@ -7,8 +7,7 @@ Format of a block with N keys:
 * 2 bytes: is_leaf. 1 for leaf, 0 for node.
 * 4 bytes: (unused)
 * 8*N bytes: keys
-* 8*(N+1) bytes: values. In leaves, last value is null. (In the future, it
-  may hold a pointer to the next leaf.)
+* 8*(N+1) bytes: values. In leaves, last value is a pointer to the next leaf.
 Total: 16 + 16*N
 
 header block:
@@ -80,7 +79,11 @@ class BTree:
     """
 
     def __init__(self, file):
-        self.f = open_dbfile(file)
+        try:
+            self.f = io.FileIO(file, "r+b")
+        except FileNotFoundError:
+            self.f = io.FileIO(file, "x+b")
+
         st = os.fstat(self.f.fileno())
         self.file_size = st.st_size
         self.bcache = BlockCache(self.f)
@@ -116,6 +119,7 @@ class BTree:
         root = self.node_at(root_addr)
         root.set_nkeys(0)
         root.set_is_leaf(1)
+        root.set_next_leaf_ptr(0)
         self.bcache.write(root.block)
 
     def extend_file(self):
@@ -165,10 +169,81 @@ class BTree:
         self.bcache.write(header)
         self.bcache.write(node.block)
 
+    def check_integrity(self):
+        """
+        Checks that:
+        * every node has at most one parent.
+        * free list is a single linear list.
+        * leaves are connected in a single linear list.
+        * every block is either in free list or in the tree (or is header).
+        """
+        free_list_ptrs = {}
+        next_leaf_ptrs = {}
+        child_ptrs = {}
+
+        iotrace_scope(False)
+        for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
+            node = self.node_at(addr)
+            if node.get_nkeys() == INVALID_NKEYS:
+                next_free = unpack(UINT64, node.block.buf, OFFSET_NEXT_FREE)
+                free_list_ptrs[addr] = next_free
+            elif node.get_is_leaf():
+                next_leaf_ptrs[addr] = node.get_next_leaf_ptr()
+            else:
+                child_ptrs[addr] = node.values.tolist()[:node.get_nkeys()+1]
+
+        # test node parents
+        def recurse(n):
+            assert n not in tree_blocks, f"Nodes have at most one parent: {n}"
+            tree_blocks.add(n)
+            if n in next_leaf_ptrs:
+                # leaf
+                return
+            for c in child_ptrs[n]:
+                recurse(c)
+
+        tree_blocks = set()
+        root_ptr = self.get_root().get_addr()
+        recurse(root_ptr)
+
+        # test free list
+        if len(free_list_ptrs) > 0:
+            free_pointees = set(free_list_ptrs.values())
+            free_pointers = set(free_list_ptrs)
+            assert len(free_pointers - free_pointees) == 1, \
+                "free list must have a single head"
+            freeblock = (free_pointers - free_pointees).pop()  # head of free list
+            while freeblock != 0:
+                free_pointers.remove(freeblock)
+                freeblock = free_list_ptrs[freeblock]
+            assert len(free_pointers) == 0
+
+        # test leaf list
+        leaf_pointees = set(next_leaf_ptrs.values())
+        leaf_pointers = set(next_leaf_ptrs)
+        assert leaf_pointees - leaf_pointers == {0}
+        assert len(leaf_pointers - leaf_pointees) == 1, \
+            "leaf list must have a single head"
+        leaf = (leaf_pointers - leaf_pointees).pop()  # head of leaf list
+        while leaf != 0:
+            leaf_pointers.remove(leaf)
+            leaf = next_leaf_ptrs[leaf]
+        assert len(leaf_pointers) == 0
+
+        # test completeness of free list and tree blocks
+        free_blocks = set(free_list_ptrs)
+        all_blocks = set(range(BLOCK_SIZE, self.file_size, BLOCK_SIZE))
+        orphan_blocks = all_blocks - (free_blocks | tree_blocks)
+        assert len(free_blocks & tree_blocks) == 0
+        assert len(orphan_blocks) == 0, \
+            f"{len(orphan_blocks)} orphan blocks: {orphan_blocks}"
+
+        iotrace_pop()
+
     def print(self):
         freelist = []
         iotrace_scope(False)
-        for addr in range(0, self.file_size, BLOCK_SIZE):
+        for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
             node = self.node_at(addr)
             if node.get_nkeys() == INVALID_NKEYS:
                 next_free = unpack(UINT64, node.block.buf, OFFSET_NEXT_FREE)
@@ -188,7 +263,13 @@ class BTree:
         v, success = search(self, k)
         return v if success else default
 
-    def insert(self, k, v, allow_update=False):
+    def insert(self, k, v):
+        self._insert(k, v, False)
+
+    def update(self, k, v):
+        self._insert(k, v, True)
+
+    def _insert(self, k, v, allow_update):
         assert isinstance(k, int)
         assert isinstance(v, int)
         new_root_addr = insert(self, k, v, allow_update)
@@ -201,8 +282,13 @@ class BTree:
         if new_root_addr is not None:
             self.set_root(new_root_addr)
 
-    def __iter__(self):
-        yield from iter_node(self, self.get_root())
+    def range(self, *, lo=None, hi=None, limit=None):
+        return tree_range(self, lo, hi, limit)
+
+    def depth(self):
+        _, d = leftmost_leaf_and_depth(self)
+        return d
+
 
 class DiskBlock:
     __slots__ = ["addr", "buf"]
@@ -234,6 +320,12 @@ class NodeBuf:
 
     def set_is_leaf(self, is_leaf):
         pack(UINT16, self.block.buf, OFFSET_IS_LEAF, is_leaf)
+
+    def get_next_leaf_ptr(self):
+        return self.values[MAX_NKEYS]
+
+    def set_next_leaf_ptr(self, addr):
+        self.values[MAX_NKEYS] = addr
 
 
 class _LRUNode:
@@ -325,21 +417,46 @@ class BlockCache:
         self.f.readinto(block.buf)
         return block
 
+#######################################################
+#                      Ranges
+#######################################################
 
-def open_dbfile(file):
-    try:
-        return io.FileIO(file, "r+b")
-    except FileNotFoundError:
-        return io.FileIO(file, "x+b")
-
-def iter_node(tree, node):
-    """WARNING: Breaks if tree is modified during iteration"""
-    if node.get_is_leaf():
-        for i in range(node.get_nkeys()):
-            yield node.keys[i], node.values[i]
+def tree_range(tree, lo, hi, limit):
+    """lo, hi, and limit may be None."""
+    if lo is None:
+        n, _ = leftmost_leaf_and_depth(tree)
+        i = 0
     else:
-        for i in range(node.get_nkeys() + 1):
-            yield from iter_node(tree, tree.node_at(node.values[i]))
+        n = search_until_leaf(tree, lo)
+        i, success = search_leaf(n, lo)
+
+    result = []
+    for k, v in iter_leaves(tree, n, i):
+        if hi is not None and k > hi:
+            return result
+        result.append((k, v))
+        if limit is not None and len(result) >= limit:
+            return result
+    return result
+
+def iter_leaves(tree, leaf, i):
+    """If i >= nkeys, we start iterating from the next leaf."""
+    while True:
+        assert leaf.get_is_leaf()
+        for j in range(i, leaf.get_nkeys()):
+            yield leaf.keys[j], leaf.values[j]
+        if leaf.get_next_leaf_ptr() == 0:
+            break
+        leaf = tree.node_at(leaf.get_next_leaf_ptr())
+        i = 0
+
+def leftmost_leaf_and_depth(tree):
+    n = tree.get_root()
+    i = 1
+    while not n.get_is_leaf():
+        n = tree.node_at(n.values[0])
+        i += 1
+    return n, i
 
 #######################################################
 #                      Search
@@ -349,23 +466,26 @@ def search(tree, k):
     """
     Returns (value, success). If success is False, value is None.
     """
+    n = search_until_leaf(tree, k)
+    i, success = search_leaf(n, k)
+    v = n.values[i] if success else None
+    return v, success
+
+def search_until_leaf(tree, k):
+    """Returns the leaf that contains k."""
     n = tree.get_root()
-    while True:
-        if n.get_is_leaf():
-            i, success = search_leaf(n, k)
-            v = n.values[i] if success else None
-            return v, success
+    while not n.get_is_leaf():
         i = search_node(n, k)
         n = tree.node_at(n.values[i])
+    return n
 
 def search_leaf(leaf, k):
     """
-    Returns (index, success). Search for the value, or where it would be if
-    it were in this leaf.  If k is greater than all keys, index will be
-    leaf.nkeys, so leaf.values[index] may cause an IndexError.
+    Returns (index, success). Search for the key, or the correct index at
+    which to insert the key. If k is greater than all keys, index will be
+    nkeys, so values[index] will not be a valid value.
     """
-    nkeys = leaf.get_nkeys()
-    left, right = 0, nkeys - 1
+    left, right = 0, leaf.get_nkeys() - 1
     while left <= right:
         mid = (left + right) >> 1
         midkey = leaf.keys[mid]
@@ -379,8 +499,7 @@ def search_leaf(leaf, k):
 
 def search_node(node, k):
     """Search for the index of the matching child."""
-    nkeys = node.get_nkeys()
-    left, right = 0, nkeys - 1
+    left, right = 0, node.get_nkeys() - 1
     while left <= right:
         mid = (left + right) >> 1
         midkey = node.keys[mid]
@@ -500,13 +619,13 @@ def insert_leaf(tree, leaf, i, k, v):
         midpoint = (nkeys + 2) // 2
         new_leaf = tree.new_node()
         new_leaf.set_is_leaf(1)
+        new_leaf.set_next_leaf_ptr(leaf.get_next_leaf_ptr())
 
-        array_insert_split(leaf.keys, new_leaf.keys, MAX_NKEYS,
-                           i, midpoint, k)
-        array_insert_split(leaf.values, new_leaf.values, MAX_NKEYS,
-                           i, midpoint, v)
+        array_insert_split(leaf.keys, new_leaf.keys, nkeys, i, midpoint, k)
+        array_insert_split(leaf.values, new_leaf.values, nkeys, i, midpoint, v)
 
         leaf.set_nkeys(midpoint)
+        leaf.set_next_leaf_ptr(new_leaf.get_addr())
         new_leaf.set_nkeys(MAX_NKEYS - midpoint + 1)  # includes new key
         tree.write_node(leaf)
         tree.write_node(new_leaf)
@@ -552,11 +671,13 @@ def array_insert(arr, arr_len, index, x):
     arr[index] = x
 
 def leaf_insert(leaf, nkeys, ind_k, ind_v, k, v):
+    assert leaf.get_is_leaf()
     array_insert(leaf.keys, nkeys, ind_k, k)
     array_insert(leaf.values, nkeys, ind_v, v)
     leaf.set_nkeys(nkeys + 1)
 
 def node_insert(node, nkeys, ind_k, ind_v, k, v):
+    assert not node.get_is_leaf()
     array_insert(node.keys, nkeys, ind_k, k)
     array_insert(node.values, nkeys + 1, ind_v, v)
     node.set_nkeys(nkeys + 1)
@@ -574,15 +695,14 @@ def delete_raise_error(k):
 
 def delete(tree, k):
     root = tree.get_root()
-    root_nkeys = root.get_nkeys()
-    assert root_nkeys != INVALID_NKEYS
+    assert root.get_nkeys() != INVALID_NKEYS
     if root.get_is_leaf():
-        if root_nkeys == 0:
+        if root.get_nkeys() == 0:
             raise ValueError("delete from an empty tree")
         i, success = search_leaf(root, k)
         if not success:
             delete_raise_error(k)
-        leaf_pop(root, root_nkeys, i, i)
+        leaf_pop(root, i, i)
         tree.write_node(root)
         return None
 
@@ -593,8 +713,8 @@ def delete(tree, k):
     if del_ind is not None:
         # delete from root
         # make child the root if it's the only one left
-        node_pop(root, root_nkeys, del_ind, del_ind)
-        if root_nkeys == 1:
+        node_pop(root, del_ind, del_ind+1)
+        if root.get_nkeys() == 0:
             tree.free(root)
             return root.values[0]
     if p_modified:
@@ -629,15 +749,15 @@ def delete_node(tree, node, parent, p_ind, i):
     :param node:
     :param parent: parent of node.
     :param p_ind: index within parent of node.
-    :param i: index within node of both the key and the value to delete.
-    :return: (index, p_modified). index is of the child of parent that
+    :param i: index within node of the key to delete. The value to delete is
+    at index i+1.
+    :return: (index, p_modified). index is of the key of parent that
     should be deleted. None if no such element. p_modified is True if the
     parent has been modified or index is not None.
     """
+    assert node.get_nkeys() != INVALID_NKEYS
+    node_pop(node, i, i+1)
     nkeys = node.get_nkeys()
-    assert nkeys != INVALID_NKEYS
-    node_pop(node, nkeys, i, i)
-    nkeys -= 1
     if nkeys >= MIN_NKEYS_NODE:
         tree.write_node(node)
         return None, False
@@ -650,14 +770,13 @@ def delete_node(tree, node, parent, p_ind, i):
         # sibling is pulled up to the parent.
         if left_sib_nkeys > right_sib_nkeys:
             parent_key = parent.keys[p_ind - 1]
-            key, value = node_pop(left_sib, left_sib_nkeys,
-                                  left_sib_nkeys-1, left_sib_nkeys)
+            key, value = node_pop(left_sib, left_sib_nkeys-1, left_sib_nkeys)
             node_insert(node, nkeys, 0, 0, parent_key, value)
             parent.keys[p_ind - 1] = key
             tree.write_node(left_sib)
         else:
             parent_key = parent.keys[p_ind]
-            key, value = node_pop(right_sib, right_sib_nkeys, 0, 0)
+            key, value = node_pop(right_sib, 0, 0)
             node_insert(node, nkeys, nkeys, nkeys+1, parent_key, value)
             parent.keys[p_ind] = key
             tree.write_node(right_sib)
@@ -665,32 +784,36 @@ def delete_node(tree, node, parent, p_ind, i):
         return None, True
     else:
         # merge with one sibling
-        # always move elements from left to right
+        # always move elements from right to left
         if left_sib is not None:
-            merge_left = left_sib
-            merge_left_nkeys = left_sib_nkeys
             merge_right = node
             merge_right_nkeys = nkeys
+            merge_left = left_sib
+            merge_left_nkeys = left_sib_nkeys
             ind_key_between = p_ind - 1
         else:
-            merge_left = node
-            merge_left_nkeys = nkeys
             merge_right = right_sib
             merge_right_nkeys = right_sib_nkeys
+            merge_left = node
+            merge_left_nkeys = nkeys
             ind_key_between = p_ind
 
         # when merging siblings, the key between them in the parent is pulled
         # down to the newly merged node.
-        array_insert(merge_right.keys, merge_right_nkeys,
-                     0, parent.keys[ind_key_between])
-        array_merge_prepend(merge_left.keys, merge_left_nkeys,
-                            merge_right.keys, merge_right_nkeys+1)
-        array_merge_prepend(merge_left.values, merge_left_nkeys+1,
-                            merge_right.values, merge_right_nkeys+1)
-        merge_right.set_nkeys(merge_right_nkeys + merge_left_nkeys + 1)
+        array_insert(merge_left.keys, merge_left_nkeys,
+                     merge_left_nkeys, parent.keys[ind_key_between])
 
-        tree.free(merge_left)
-        tree.write_node(merge_right)
+        # Since the key was pulled down and appended to merge_left.keys,
+        # merge_left_nkeys is one less than the real number of keys.
+        # However, merge_left_nkeys+1 is still the real number of values.
+        array_merge_append(merge_right.keys, merge_right_nkeys,
+                           merge_left.keys, merge_left_nkeys+1)
+        array_merge_append(merge_right.values, merge_right_nkeys+1,
+                           merge_left.values, merge_left_nkeys+1)
+        merge_left.set_nkeys(merge_right_nkeys + merge_left_nkeys + 1)
+
+        tree.free(merge_right)
+        tree.write_node(merge_left)
         return ind_key_between, True
 
 def delete_leaf(tree, leaf, parent, p_ind, i):
@@ -702,14 +825,13 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
     :param parent: parent of leaf
     :param p_ind: index within parent of leaf.
     :param i: index within leaf of element to delete.
-    :return: (index, p_modified). index is of the child of parent that
+    :return: (index, p_modified). index is of the key of parent that
     should be deleted. None if no such element. p_modified is True if the
     parent has been modified or index is not None.
     """
+    assert leaf.get_nkeys() != INVALID_NKEYS
+    leaf_pop(leaf, i, i)
     nkeys = leaf.get_nkeys()
-    assert nkeys != INVALID_NKEYS
-    node_pop(leaf, nkeys, i, i)
-    nkeys -= 1
     if nkeys >= MIN_NKEYS_LEAF:
         tree.write_node(leaf)
         return None, False
@@ -720,14 +842,13 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
         # If at least one sibling is above the min capacity, move an element
         # from that sibling, and change the key between them in the parent.
         if left_sib_nkeys > right_sib_nkeys:
-            key, value = node_pop(left_sib, left_sib_nkeys,
-                                  left_sib_nkeys-1, left_sib_nkeys-1)
-            node_insert(leaf, nkeys, 0, 0, key, value)
+            key, value = leaf_pop(left_sib, left_sib_nkeys-1, left_sib_nkeys-1)
+            leaf_insert(leaf, nkeys, 0, 0, key, value)
             parent.keys[p_ind - 1] = key
             tree.write_node(left_sib)
         else:
-            key, value = node_pop(right_sib, right_sib_nkeys, 0, 0)
-            node_insert(leaf, nkeys, nkeys, nkeys, key, value)
+            key, value = leaf_pop(right_sib, 0, 0)
+            leaf_insert(leaf, nkeys, nkeys, nkeys, key, value)
             parent.keys[p_ind] = right_sib.keys[0]
             tree.write_node(right_sib)
         tree.write_node(leaf)
@@ -735,29 +856,30 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
     else:
         # If neither sibling is above min capacity, pick one to merge.
         # Delete the newly emptied node in the parent.
-        # Always move elements from left to right so the key and the value to
-        # delete in the parent have the same index.
+        # Always move elements from right to left so the next_leaf_ptr of
+        # the prev leaf remains valid.
         if left_sib is not None:
-            merge_left = left_sib
-            merge_left_nkeys = left_sib_nkeys
             merge_right = leaf
             merge_right_nkeys = nkeys
+            merge_left = left_sib
+            merge_left_nkeys = left_sib_nkeys
             ind_key_between = p_ind - 1
         else:
-            merge_left = leaf
-            merge_left_nkeys = nkeys
             merge_right = right_sib
             merge_right_nkeys = right_sib_nkeys
+            merge_left = leaf
+            merge_left_nkeys = nkeys
             ind_key_between = p_ind
 
-        array_merge_prepend(merge_left.keys, merge_left_nkeys,
-                            merge_right.keys, merge_right_nkeys)
-        array_merge_prepend(merge_left.values, merge_left_nkeys,
-                            merge_right.values, merge_right_nkeys)
-        merge_right.set_nkeys(merge_right_nkeys + merge_left_nkeys)
+        array_merge_append(merge_right.keys, merge_right_nkeys,
+                           merge_left.keys, merge_left_nkeys)
+        array_merge_append(merge_right.values, merge_right_nkeys,
+                           merge_left.values, merge_left_nkeys)
+        merge_left.set_nkeys(merge_right_nkeys + merge_left_nkeys)
+        merge_left.set_next_leaf_ptr(merge_right.get_next_leaf_ptr())
 
-        tree.free(merge_left)
-        tree.write_node(merge_right)
+        tree.free(merge_right)
+        tree.write_node(merge_left)
         return ind_key_between, True
 
 def get_sibs_and_nkeys(tree, min_nkeys, parent_node, i):
@@ -788,24 +910,26 @@ def array_delete(arr, arr_len, index):
         arr[i-1] = arr[i]
     arr[arr_len-1] = 0
 
-def array_merge_prepend(src, src_len, dest, dest_len):
+def array_merge_append(src, src_len, dest, dest_len):
     assert src_len + dest_len <= len(dest)
-    for i in range(src_len+dest_len-1, src_len-1, -1):
-        dest[i] = dest[i-src_len]
     for i in range(src_len):
-        dest[i] = src[i]
+        dest[i+dest_len] = src[i]
 
-def node_pop(node, nkeys, ind_k, ind_v):
+def node_pop(node, ind_k, ind_v):
+    assert not node.get_is_leaf()
     key = node.keys[ind_k]
     value = node.values[ind_v]
+    nkeys = node.get_nkeys()
     array_delete(node.keys, nkeys, ind_k)
     array_delete(node.values, nkeys + 1, ind_v)
     node.set_nkeys(nkeys - 1)
     return key, value
 
-def leaf_pop(leaf, nkeys, ind_k, ind_v):
+def leaf_pop(leaf, ind_k, ind_v):
+    assert leaf.get_is_leaf()
     key = leaf.keys[ind_k]
     value = leaf.values[ind_v]
+    nkeys = leaf.get_nkeys()
     array_delete(leaf.keys, nkeys, ind_k)
     array_delete(leaf.values, nkeys, ind_v)
     leaf.set_nkeys(nkeys - 1)

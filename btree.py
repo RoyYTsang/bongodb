@@ -24,7 +24,8 @@ import os
 import io
 import struct
 
-BLOCK_SIZE = 2**12
+from disk import BlockCache, DiskBlock, iotrace, BLOCK_SIZE
+
 MAX_NKEYS = (BLOCK_SIZE - 16) // 16
 CACHE_SIZE = 8192
 
@@ -48,47 +49,14 @@ def pack(data_type, buf, offset, data):
 def unpack(data_type, buf, offset):
     return data_type.unpack_from(buf, offset)[0]
 
-READS = 0
-WRITES = 0
-IOTRACE = [True]
-def iotrace_read():
-    global READS
-    if IOTRACE[-1]:
-        READS += 1
-def iotrace_write():
-    global WRITES
-    if IOTRACE[-1]:
-        WRITES += 1
-def iotrace_scope(enable):
-    global IOTRACE
-    IOTRACE.append(enable)
-def iotrace_pop():
-    IOTRACE.pop()
-    if len(IOTRACE) == 0:
-        raise ValueError("popped last iotrace scope")
-def iotrace_reset():
-    global READS, WRITES
-    READS = 0
-    WRITES = 0
-
-
 class BTree:
     """
     WARNING: ALWAYS call close() on this object. If you don't, data in the
     cache might not be written to disk.
     """
 
-    def __init__(self, file):
-        try:
-            self.f = io.FileIO(file, "r+b")
-        except FileNotFoundError:
-            self.f = io.FileIO(file, "x+b")
-
-        st = os.fstat(self.f.fileno())
-        self.file_size = st.st_size
-        self.bcache = BlockCache(self.f)
-        if self.file_size == 0:
-            self.init_file()
+    def __init__(self, filename):
+        self.nfile = NodeFile(filename)
 
     def __enter__(self):
         return self
@@ -98,6 +66,63 @@ class BTree:
         return False
 
     def close(self):
+        self.nfile.close()
+
+    def check_integrity(self):
+        self.nfile.check_integrity()
+
+    def get(self, k, default=None):
+        assert isinstance(k, int)
+        v, success = search(self.nfile, k)
+        return v if success else default
+
+    def insert(self, k, v):
+        self._insert(k, v, False)
+
+    def update(self, k, v):
+        self._insert(k, v, True)
+
+    def _insert(self, k, v, allow_update):
+        assert isinstance(k, int)
+        assert isinstance(v, int)
+        new_root_addr = insert(self.nfile, k, v, allow_update)
+        if new_root_addr is not None:
+            self.nfile.set_root(new_root_addr)
+
+    def delete(self, k):
+        assert isinstance(k, int)
+        new_root_addr = delete(self.nfile, k)
+        if new_root_addr is not None:
+            self.nfile.set_root(new_root_addr)
+
+    def range(self, *, lo=None, hi=None, limit=None):
+        """
+        Returns key-value pairs such that lo <= key <= hi.
+        :param lo:
+        :param hi:
+        :param limit:
+        :return: a list of pairs (key, value)
+        """
+        return tree_range(self.nfile, lo, hi, limit)
+
+    def depth(self):
+        _, d = leftmost_leaf_and_depth(self.nfile)
+        return d
+
+class NodeFile:
+    def __init__(self, filename):
+        try:
+            self.f = io.FileIO(filename, "r+b")
+        except FileNotFoundError:
+            self.f = io.FileIO(filename, "x+b")
+
+        st = os.fstat(self.f.fileno())
+        self.file_size = st.st_size
+        self.bcache = BlockCache(self.f, CACHE_SIZE)
+        if self.file_size == 0:
+            self._init_file()
+
+    def close(self):
         self.bcache.flush()
         self.bcache = None
         self.f.close()
@@ -105,10 +130,10 @@ class BTree:
     def write_node(self, node):
         self.bcache.write(node.block)
 
-    def init_file(self):
+    def _init_file(self):
         """Init header block and root."""
-        self.extend_file()
-        root_addr = self.extend_file()
+        self._extend_file()
+        root_addr = self._extend_file()
 
         # set root pointer to a new root. free list pointer = null.
         header = DiskBlock(0)
@@ -122,12 +147,9 @@ class BTree:
         root.set_next_leaf_ptr(0)
         self.bcache.write(root.block)
 
-    def extend_file(self):
+    def _extend_file(self):
         """Creates a new block. Returns its address."""
         old_size = self.file_size
-        # seek past the end of the file and write
-        self.f.seek(old_size + BLOCK_SIZE - 1)
-        self.f.write(b"\0")
         self.file_size += BLOCK_SIZE
         return old_size
 
@@ -136,7 +158,7 @@ class BTree:
         header = self.bcache.read(0)
         free_ptr = unpack(UINT64, header.buf, OFFSET_FREE_PTR)
         if free_ptr == 0:
-            addr = self.extend_file()
+            addr = self._extend_file()
             block = DiskBlock(addr)
             return NodeBuf(block)
         else:
@@ -181,7 +203,7 @@ class BTree:
         next_leaf_ptrs = {}
         child_ptrs = {}
 
-        iotrace_scope(False)
+        iotrace.scope()
         for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
             node = self.node_at(addr)
             if node.get_nkeys() == INVALID_NKEYS:
@@ -238,11 +260,11 @@ class BTree:
         assert len(orphan_blocks) == 0, \
             f"{len(orphan_blocks)} orphan blocks: {orphan_blocks}"
 
-        iotrace_pop()
+        iotrace.pop()
 
     def print(self):
         freelist = []
-        iotrace_scope(False)
+        iotrace.scope()
         for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
             node = self.node_at(addr)
             if node.get_nkeys() == INVALID_NKEYS:
@@ -256,46 +278,8 @@ class BTree:
 
         for addr, next_free in freelist:
             print(f"{addr} -> {next_free}")
-        iotrace_pop()
+        iotrace.pop()
 
-    def get(self, k, default=None):
-        assert isinstance(k, int)
-        v, success = search(self, k)
-        return v if success else default
-
-    def insert(self, k, v):
-        self._insert(k, v, False)
-
-    def update(self, k, v):
-        self._insert(k, v, True)
-
-    def _insert(self, k, v, allow_update):
-        assert isinstance(k, int)
-        assert isinstance(v, int)
-        new_root_addr = insert(self, k, v, allow_update)
-        if new_root_addr is not None:
-            self.set_root(new_root_addr)
-
-    def delete(self, k):
-        assert isinstance(k, int)
-        new_root_addr = delete(self, k)
-        if new_root_addr is not None:
-            self.set_root(new_root_addr)
-
-    def range(self, *, lo=None, hi=None, limit=None):
-        return tree_range(self, lo, hi, limit)
-
-    def depth(self):
-        _, d = leftmost_leaf_and_depth(self)
-        return d
-
-
-class DiskBlock:
-    __slots__ = ["addr", "buf"]
-
-    def __init__(self, addr):
-        self.addr = addr
-        self.buf = bytearray(BLOCK_SIZE)
 
 class NodeBuf:
     __slots__ = ["block", "keys", "values"]
@@ -328,110 +312,21 @@ class NodeBuf:
         self.values[MAX_NKEYS] = addr
 
 
-class _LRUNode:
-    """next goes toward the front, i.e. the most recently used."""
-    __slots__ = ["prev", "next", "block"]
-    def __init__(self):
-        self.block, self.prev, self.next = None, None, None
-
-class BlockCache:
-    """
-    To disable the cache, set cache size to 0.
-    """
-    def __init__(self, f):
-        self.f = f
-        self.cache = {}
-        self.dirty = set()
-        self.end_dummy = _LRUNode()
-        self.head_dummy = _LRUNode()
-        self.end_dummy.next = self.head_dummy
-        self.head_dummy.prev = self.end_dummy
-
-    def _remove(self, node):
-        prev, next = node.prev, node.next
-        prev.next = next
-        next.prev = prev
-
-    def _push(self, node):
-        self.head_dummy.prev.next = node
-        node.prev = self.head_dummy.prev
-        node.next = self.head_dummy
-        self.head_dummy.prev = node
-
-    def _access(self, addr):
-        if addr in self.cache:
-            node = self.cache[addr]
-            self._remove(node)
-            self._push(node)
-            return node
-        elif len(self.cache) < CACHE_SIZE:
-            node = _LRUNode()
-            self._push(node)
-            self.cache[addr] = node
-            return node
-        else:
-            # evict LRU
-            node = self.end_dummy.next
-            del self.cache[node.block.addr]
-            if node.block.addr in self.dirty:
-                self.dirty.remove(node.block.addr)
-                self._write_block(node.block)
-            self._remove(node)
-            self._push(node)
-            self.cache[addr] = node
-            node.block = None
-            return node
-
-    def read(self, addr):
-        if CACHE_SIZE == 0:
-            return self._read_block(addr)
-        node = self._access(addr)
-        if node.block is None:
-            node.block = self._read_block(addr)
-        return node.block
-
-    def write(self, block):
-        if CACHE_SIZE == 0:
-            self._write_block(block)
-            return
-        node = self._access(block.addr)
-        node.block = block
-        self.dirty.add(block.addr)
-
-    def flush(self):
-        for addr in self.dirty:
-            self._write_block(self.cache[addr].block)
-        self.dirty.clear()
-
-    def _write_block(self, block):
-        iotrace_write()
-        self.f.seek(block.addr)
-        nbytes = self.f.write(block.buf)
-        os.fsync(self.f.fileno())
-        assert nbytes == len(block.buf)
-
-    def _read_block(self, addr):
-        iotrace_read()
-        block = DiskBlock(addr)
-        self.f.seek(addr)
-        self.f.readinto(block.buf)
-        return block
-
 #######################################################
 #                      Ranges
 #######################################################
 
-def tree_range(tree, lo, hi, limit):
+def tree_range(nfile, lo, hi, limit):
     """lo, hi, and limit may be None."""
     if lo is None:
-        n, _ = leftmost_leaf_and_depth(tree)
+        n, _ = leftmost_leaf_and_depth(nfile)
         i = 0
     else:
-        n = search_until_leaf(tree, lo)
+        n = search_until_leaf(nfile, lo)
         i, success = search_leaf(n, lo)
 
     result = []
-    for k, v in iter_leaves(tree, n, i):
+    for k, v in iter_leaves(nfile, n, i):
         if hi is not None and k > hi:
             return result
         result.append((k, v))
@@ -439,7 +334,7 @@ def tree_range(tree, lo, hi, limit):
             return result
     return result
 
-def iter_leaves(tree, leaf, i):
+def iter_leaves(nfile, leaf, i):
     """If i >= nkeys, we start iterating from the next leaf."""
     while True:
         assert leaf.get_is_leaf()
@@ -447,14 +342,14 @@ def iter_leaves(tree, leaf, i):
             yield leaf.keys[j], leaf.values[j]
         if leaf.get_next_leaf_ptr() == 0:
             break
-        leaf = tree.node_at(leaf.get_next_leaf_ptr())
+        leaf = nfile.node_at(leaf.get_next_leaf_ptr())
         i = 0
 
-def leftmost_leaf_and_depth(tree):
-    n = tree.get_root()
+def leftmost_leaf_and_depth(nfile):
+    n = nfile.get_root()
     i = 1
     while not n.get_is_leaf():
-        n = tree.node_at(n.values[0])
+        n = nfile.node_at(n.values[0])
         i += 1
     return n, i
 
@@ -462,21 +357,21 @@ def leftmost_leaf_and_depth(tree):
 #                      Search
 #######################################################
 
-def search(tree, k):
+def search(nfile, k):
     """
     Returns (value, success). If success is False, value is None.
     """
-    n = search_until_leaf(tree, k)
+    n = search_until_leaf(nfile, k)
     i, success = search_leaf(n, k)
     v = n.values[i] if success else None
     return v, success
 
-def search_until_leaf(tree, k):
+def search_until_leaf(nfile, k):
     """Returns the leaf that contains k."""
-    n = tree.get_root()
+    n = nfile.get_root()
     while not n.get_is_leaf():
         i = search_node(n, k)
-        n = tree.node_at(n.values[i])
+        n = nfile.node_at(n.values[i])
     return n
 
 def search_leaf(leaf, k):
@@ -516,51 +411,51 @@ def search_node(node, k):
 #                      Insert
 #######################################################
 
-def insert(tree, k, v, allow_update):
+def insert(nfile, k, v, allow_update):
     """
     Returns new root address, or None if no new root.
     If allow_update is False, throws a ValueError if key is already in
     the tree. Otherwise, lookup the key and update its value.
     """
-    root = tree.get_root()
-    new_node, new_key = insert_recurse(tree, root, k, v, allow_update)
+    root = nfile.get_root()
+    new_node, new_key = insert_recurse(nfile, root, k, v, allow_update)
     if new_node is not None:
         # split root
-        new_root = tree.new_node()
+        new_root = nfile.new_node()
         new_root.set_is_leaf(0)
         new_root.keys[0] = new_key
         new_root.values[0] = root.get_addr()
         new_root.values[1] = new_node.get_addr()
         new_root.set_nkeys(1)
-        tree.write_node(new_root)
+        nfile.write_node(new_root)
         return new_root.get_addr()
     return None
 
-def insert_recurse(tree, node, k, v, allow_update):
+def insert_recurse(nfile, node, k, v, allow_update):
     if node.get_is_leaf():
         i, success = search_leaf(node, k)
         if success and allow_update:
-            update_leaf(tree, node, i, v)
+            update_leaf(nfile, node, i, v)
             return None, None
         elif success and not allow_update:
             raise ValueError("insert duplicate key: " + repr(k))
-        new_node, new_key = insert_leaf(tree, node, i, k, v)
+        new_node, new_key = insert_leaf(nfile, node, i, k, v)
     else:
         i = search_node(node, k)
         child_addr = node.values[i]
-        child = tree.node_at(child_addr)
-        new_node, new_key = insert_recurse(tree, child, k, v, allow_update)
+        child = nfile.node_at(child_addr)
+        new_node, new_key = insert_recurse(nfile, child, k, v, allow_update)
         if new_node is not None:
-            new_node, new_key = insert_node(tree, node, i, new_key, new_node)
+            new_node, new_key = insert_node(nfile, node, i, new_key, new_node)
     return new_node, new_key
 
-def update_leaf(tree, node, i, v):
+def update_leaf(nfile, node, i, v):
     node.values[i] = v
-    tree.write_node(node)
+    nfile.write_node(node)
 
-def insert_node(tree, node, i, new_key, new_child):
+def insert_node(nfile, node, i, new_key, new_child):
     """
-    :param tree: the BTree.
+    :param nfile: the BTree.
     :param node:
     :param i: index within node values of the child that was just split.
     :param new_key: new key to be inserted between new_child and the child
@@ -572,7 +467,7 @@ def insert_node(tree, node, i, new_key, new_child):
     assert nkeys != INVALID_NKEYS
     if nkeys < MAX_NKEYS:
         node_insert(node, nkeys, i, i+1, new_key, new_child.get_addr())
-        tree.write_node(node)
+        nfile.write_node(node)
         return None, None
     else:
         # Note: ceil(N/2) == (N+1)//2 for any positive integer N.
@@ -582,7 +477,7 @@ def insert_node(tree, node, i, new_key, new_child):
         kmidpoint = (MAX_NKEYS + 1) // 2  # index of middle key
         vmidpoint = kmidpoint + 1
 
-        new_node = tree.new_node()
+        new_node = nfile.new_node()
         new_node.set_is_leaf(0)
 
         # split after midpoint, so middle key stays in old node.
@@ -598,11 +493,11 @@ def insert_node(tree, node, i, new_key, new_child):
 
         node.set_nkeys(kmidpoint)
         new_node.set_nkeys(MAX_NKEYS - kmidpoint)
-        tree.write_node(node)
-        tree.write_node(new_node)
+        nfile.write_node(node)
+        nfile.write_node(new_node)
         return new_node, middle_key
 
-def insert_leaf(tree, leaf, i, k, v):
+def insert_leaf(nfile, leaf, i, k, v):
     """
     Returns (new leaf, new leaf's smallest key)
     If leaf is full, modifies the leaf and returns the new leaf split
@@ -612,12 +507,12 @@ def insert_leaf(tree, leaf, i, k, v):
     assert nkeys != INVALID_NKEYS
     if nkeys < MAX_NKEYS:
         leaf_insert(leaf, nkeys, i, i, k, v)
-        tree.write_node(leaf)
+        nfile.write_node(leaf)
         return None, None
     else:
         # ceil((N+1)/2) == (N+2)//2
         midpoint = (nkeys + 2) // 2
-        new_leaf = tree.new_node()
+        new_leaf = nfile.new_node()
         new_leaf.set_is_leaf(1)
         new_leaf.set_next_leaf_ptr(leaf.get_next_leaf_ptr())
 
@@ -627,8 +522,8 @@ def insert_leaf(tree, leaf, i, k, v):
         leaf.set_nkeys(midpoint)
         leaf.set_next_leaf_ptr(new_leaf.get_addr())
         new_leaf.set_nkeys(MAX_NKEYS - midpoint + 1)  # includes new key
-        tree.write_node(leaf)
-        tree.write_node(new_leaf)
+        nfile.write_node(leaf)
+        nfile.write_node(new_leaf)
         return new_leaf, new_leaf.keys[0]
 
 def array_insert_split(arr, new_arr, arr_len, index, midpoint, x):
@@ -693,8 +588,8 @@ MIN_NKEYS_NODE = MAX_NKEYS // 2
 def delete_raise_error(k):
     raise ValueError("delete a key that is not in tree: " + repr(k))
 
-def delete(tree, k):
-    root = tree.get_root()
+def delete(nfile, k):
+    root = nfile.get_root()
     assert root.get_nkeys() != INVALID_NKEYS
     if root.get_is_leaf():
         if root.get_nkeys() == 0:
@@ -703,49 +598,49 @@ def delete(tree, k):
         if not success:
             delete_raise_error(k)
         leaf_pop(root, i, i)
-        tree.write_node(root)
+        nfile.write_node(root)
         return None
 
     i = search_node(root, k)
     child_addr = root.values[i]
-    child = tree.node_at(child_addr)
-    del_ind, p_modified = delete_recurse(tree, child, root, i, k)
+    child = nfile.node_at(child_addr)
+    del_ind, p_modified = delete_recurse(nfile, child, root, i, k)
     if del_ind is not None:
         # delete from root
         # make child the root if it's the only one left
         node_pop(root, del_ind, del_ind+1)
         if root.get_nkeys() == 0:
-            tree.free(root)
+            nfile.free(root)
             return root.values[0]
     if p_modified:
-        tree.write_node(root)
+        nfile.write_node(root)
     return None
 
-def delete_recurse(tree, node, parent, p_ind, k):
+def delete_recurse(nfile, node, parent, p_ind, k):
     if node.get_is_leaf():
         i, success = search_leaf(node, k)
         if not success:
             delete_raise_error(k)
-        del_ind, p_modified = delete_leaf(tree, node, parent, p_ind, i)
+        del_ind, p_modified = delete_leaf(nfile, node, parent, p_ind, i)
         return del_ind, p_modified
     else:
         i = search_node(node, k)
         child_addr = node.values[i]
-        child = tree.node_at(child_addr)
-        node_del_ind, node_modified = delete_recurse(tree, child, node, i, k)
+        child = nfile.node_at(child_addr)
+        node_del_ind, node_modified = delete_recurse(nfile, child, node, i, k)
         if node_del_ind is not None:
-            del_ind, p_modified = delete_node(tree, node, parent,
+            del_ind, p_modified = delete_node(nfile, node, parent,
                                               p_ind, node_del_ind)
             return del_ind, p_modified
         if node_modified:
-            tree.write_node(node)
+            nfile.write_node(node)
         return None, False
 
-def delete_node(tree, node, parent, p_ind, i):
+def delete_node(nfile, node, parent, p_ind, i):
     """
     This function may modify parent's keys. Writes node if it won't be
     deleted by the delete algorithm.
-    :param tree:
+    :param nfile:
     :param node:
     :param parent: parent of node.
     :param p_ind: index within parent of node.
@@ -759,11 +654,11 @@ def delete_node(tree, node, parent, p_ind, i):
     node_pop(node, i, i+1)
     nkeys = node.get_nkeys()
     if nkeys >= MIN_NKEYS_NODE:
-        tree.write_node(node)
+        nfile.write_node(node)
         return None, False
 
     left_sib, right_sib, left_sib_nkeys, right_sib_nkeys \
-        = get_sibs_and_nkeys(tree, MIN_NKEYS_NODE, parent, p_ind)
+        = get_sibs_and_nkeys(nfile, MIN_NKEYS_NODE, parent, p_ind)
     if left_sib_nkeys > MIN_NKEYS_NODE or right_sib_nkeys > MIN_NKEYS_NODE:
         # When moving a value from a sibling, the key in the parent between
         # the node and the sibling is pulled down, and the key from the
@@ -773,14 +668,14 @@ def delete_node(tree, node, parent, p_ind, i):
             key, value = node_pop(left_sib, left_sib_nkeys-1, left_sib_nkeys)
             node_insert(node, nkeys, 0, 0, parent_key, value)
             parent.keys[p_ind - 1] = key
-            tree.write_node(left_sib)
+            nfile.write_node(left_sib)
         else:
             parent_key = parent.keys[p_ind]
             key, value = node_pop(right_sib, 0, 0)
             node_insert(node, nkeys, nkeys, nkeys+1, parent_key, value)
             parent.keys[p_ind] = key
-            tree.write_node(right_sib)
-        tree.write_node(node)
+            nfile.write_node(right_sib)
+        nfile.write_node(node)
         return None, True
     else:
         # merge with one sibling
@@ -812,15 +707,15 @@ def delete_node(tree, node, parent, p_ind, i):
                            merge_left.values, merge_left_nkeys+1)
         merge_left.set_nkeys(merge_right_nkeys + merge_left_nkeys + 1)
 
-        tree.free(merge_right)
-        tree.write_node(merge_left)
+        nfile.free(merge_right)
+        nfile.write_node(merge_left)
         return ind_key_between, True
 
-def delete_leaf(tree, leaf, parent, p_ind, i):
+def delete_leaf(nfile, leaf, parent, p_ind, i):
     """
     This function may modify parent's keys. Writes node if it won't be
     deleted by the delete algorithm.
-    :param tree:
+    :param nfile:
     :param leaf:
     :param parent: parent of leaf
     :param p_ind: index within parent of leaf.
@@ -833,11 +728,11 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
     leaf_pop(leaf, i, i)
     nkeys = leaf.get_nkeys()
     if nkeys >= MIN_NKEYS_LEAF:
-        tree.write_node(leaf)
+        nfile.write_node(leaf)
         return None, False
 
     left_sib, right_sib, left_sib_nkeys, right_sib_nkeys \
-        = get_sibs_and_nkeys(tree, MIN_NKEYS_LEAF, parent, p_ind)
+        = get_sibs_and_nkeys(nfile, MIN_NKEYS_LEAF, parent, p_ind)
     if left_sib_nkeys > MIN_NKEYS_LEAF or right_sib_nkeys > MIN_NKEYS_LEAF:
         # If at least one sibling is above the min capacity, move an element
         # from that sibling, and change the key between them in the parent.
@@ -845,13 +740,13 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
             key, value = leaf_pop(left_sib, left_sib_nkeys-1, left_sib_nkeys-1)
             leaf_insert(leaf, nkeys, 0, 0, key, value)
             parent.keys[p_ind - 1] = key
-            tree.write_node(left_sib)
+            nfile.write_node(left_sib)
         else:
             key, value = leaf_pop(right_sib, 0, 0)
             leaf_insert(leaf, nkeys, nkeys, nkeys, key, value)
             parent.keys[p_ind] = right_sib.keys[0]
-            tree.write_node(right_sib)
-        tree.write_node(leaf)
+            nfile.write_node(right_sib)
+        nfile.write_node(leaf)
         return None, True
     else:
         # If neither sibling is above min capacity, pick one to merge.
@@ -878,15 +773,15 @@ def delete_leaf(tree, leaf, parent, p_ind, i):
         merge_left.set_nkeys(merge_right_nkeys + merge_left_nkeys)
         merge_left.set_next_leaf_ptr(merge_right.get_next_leaf_ptr())
 
-        tree.free(merge_right)
-        tree.write_node(merge_left)
+        nfile.free(merge_right)
+        nfile.write_node(merge_left)
         return ind_key_between, True
 
-def get_sibs_and_nkeys(tree, min_nkeys, parent_node, i):
+def get_sibs_and_nkeys(nfile, min_nkeys, parent_node, i):
     """
     sibs are None if they don't exist.
     sib nkeys are 0 if the sib doesn't exist.
-    :param tree:
+    :param nfile:
     :param min_nkeys: If left sib has greater than min_nkeys, don't bother
     to read right sib.
     :param parent_node:
@@ -894,11 +789,11 @@ def get_sibs_and_nkeys(tree, min_nkeys, parent_node, i):
     :return: (left sib, right sib, left sib nkeys, right sib nkeys)
     """
     # avoid reading right sibling if left is known to be good.
-    left_sib = tree.node_at(parent_node.values[i-1]) if i > 0 else None
+    left_sib = nfile.node_at(parent_node.values[i-1]) if i > 0 else None
     left_sib_nkeys = left_sib.get_nkeys() if left_sib else 0
     if left_sib is not None and left_sib_nkeys > min_nkeys:
         return left_sib, None, left_sib_nkeys, 0
-    right_sib = tree.node_at(parent_node.values[i+1]) if i < parent_node.get_nkeys() else None
+    right_sib = nfile.node_at(parent_node.values[i+1]) if i < parent_node.get_nkeys() else None
     right_sib_nkeys = right_sib.get_nkeys() if right_sib else 0
     return left_sib, right_sib, left_sib_nkeys, right_sib_nkeys
 

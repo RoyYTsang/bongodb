@@ -5,7 +5,16 @@
 #include <assert.h>
 #include <time.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
+#define PERROR_AND_EXIT()  \
+    do {  \
+        perror(__func__); \
+        exit(1); \
+    } while (0)
 
 #define BLOCK_SIZE 4096
 #define MAX_NKEYS  ((BLOCK_SIZE - 16) / 16)
@@ -22,8 +31,8 @@ typedef char block_buf[BLOCK_SIZE];
  * buf_count: number of used buffers. Useful for checking for leaked buffers.
  */
 struct btree {
-    FILE *nfile;
     bt_value_or_addr_t file_size;
+    int fd;
     int buf_count;
     block_buf *next_free_block_buf;
     block_buf bufs[NUM_BUFS];
@@ -63,7 +72,7 @@ bt_new_block_addr(struct btree *bt) {
 void *
 bt_new_block_buf(struct btree *bt) {
     if (!bt->next_free_block_buf) {
-        fprintf(stderr, "bt_new_block_buf: out of buffers\n");
+        fprintf(stderr, "%s: out of buffers\n", __func__);
         exit(1);
     }
     block_buf *buf = bt->next_free_block_buf;
@@ -90,16 +99,18 @@ bt_free_block_buf(struct btree *bt, void *buf) {
  */
 struct node *
 bt_read_node(struct btree *bt, bt_value_or_addr_t addr) {
-    int seek_err = fseek(bt->nfile, addr, SEEK_SET);
-    if (seek_err) {
-        perror("bt_read_node: fseek");
-        exit(1);
+    off_t seek_err = lseek(bt->fd, addr, SEEK_SET);
+    if (seek_err == -1) {
+        PERROR_AND_EXIT();
     }
 
     void *buf = bt_new_block_buf(bt);
-    int count = fread(buf, BLOCK_SIZE, 1, bt->nfile);
-    if (count != 1) {
-        perror("bt_read_node: fread");
+    ssize_t count = read(bt->fd, buf, BLOCK_SIZE);
+    if (count == -1) {
+        PERROR_AND_EXIT();
+    } else if (count != BLOCK_SIZE) {
+        fprintf(stderr, "%s: read %zi (not equal to a block) at address %" PRIu64 "\n",
+                __func__, count, addr);
         exit(1);
     }
 
@@ -108,15 +119,17 @@ bt_read_node(struct btree *bt, bt_value_or_addr_t addr) {
 
 void
 bt_write_node(struct btree *bt, struct node *node, bt_value_or_addr_t addr) {
-    int seek_err = fseek(bt->nfile, addr, SEEK_SET);
-    if (seek_err) {
-        perror("bt_write_node: fseek");
-        exit(1);
+    int seek_err = lseek(bt->fd, addr, SEEK_SET);
+    if (seek_err == -1) {
+        PERROR_AND_EXIT();
     }
 
-    int count = fwrite(node, BLOCK_SIZE, 1, bt->nfile);
-    if (count != 1) {
-        perror("bt_write_node: fwrite");
+    ssize_t count = write(bt->fd, node, BLOCK_SIZE);
+    if (count == -1) {
+        PERROR_AND_EXIT();
+    } else if (count != BLOCK_SIZE) {
+        fprintf(stderr, "%s: wrote %zi (not equal to a block) at address %" PRIu64 "\n",
+                __func__, count, addr);
         exit(1);
     }
 }
@@ -176,33 +189,22 @@ bt_set_root(struct btree *bt, bt_value_or_addr_t addr) {
 
 void
 bt_open(struct btree *bt, const char *filename) {
-    FILE *file = fopen(filename, "r+");
-
-    // If we could not open, file may not exist yet. Try creating the file.
-    if (!file) {
-        file = fopen(filename, "w+");
-    }
-
-    if (!file) {
-        perror("bt_open: fopen");
+    int fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (fd == -1) {
+        perror(__func__);
         exit(1);
     }
-    bt->nfile = file;
+    bt->fd = fd;
 
-    // seek to end
-    int seek_err = fseek(file, 0, SEEK_END);
-    if (seek_err) {
-        perror("bt_open: fseek");
-        exit(1);
+    struct stat stbuf;
+    fstat(fd, &stbuf);
+    if (errno == -1) {
+        PERROR_AND_EXIT();
     }
-
-    // get file position of the end
-    long size = ftell(file);
-    if (size == -1L) {
-        perror("bt_open: ftell");
-        exit(1);
+    bt->file_size = stbuf.st_size;
+    if (bt->file_size % BLOCK_SIZE != 0) {
+        fprintf(stderr, "%s: size of file \"%s\" not multiple of block size\n", __func__, filename);
     }
-    bt->file_size = size;
 
     // init bufs
     bt->next_free_block_buf = bt->bufs;
@@ -239,11 +241,9 @@ bt_open(struct btree *bt, const char *filename) {
 
 void
 bt_close(struct btree *bt) {
-    fflush(bt->nfile);
-    int close_err = fclose(bt->nfile);
-    if (close_err) {
-        perror("bt_close");
-        exit(1);
+    int close_err = close(bt->fd);
+    if (close_err == -1) {
+        PERROR_AND_EXIT();
     }
 }
 

@@ -1,4 +1,38 @@
 
+/*
+ * READ THIS before modifying this file:
+ * - Some functions that operate on the btree allocate a block_buf.
+ *   Remember to free it.
+ */
+
+/************* FORMAT OF THE DATABASE FILE ***************\
+ * A database file begins with a single header block.
+ * The rest of the file contains data blocks or free blocks.
+ *
+ * header block:
+ * - 8 bytes: pointer to root block
+ * - 8 bytes: pointer to free list
+ *
+ * block with a maximum of N keys:
+ * - 2 bytes: nkeys, the number of keys
+ * - 2 bytes: is_leaf. 1 for leaf, 0 for node.
+ * - 4 bytes: (unused)
+ * - 8*N bytes: keys
+ * - 8*(N+1) bytes: values. In leaves, last value is a pointer to the next leaf.
+ * Total: 16 + 16*N
+ *
+ * free block:
+ * - 2 bytes: set to INVALID_NKEYS
+ * - 6 bytes: (unused)
+ * - 8*N bytes: (unused)
+ * - 8 bytes: pointer to next free block, or null.
+ * - 8*N bytes: (unused)
+ *
+ * Note that in a free block, the pointer to the next free block can
+ * be accessed using free_block->values[0], the same location as the
+ * first value if the free_block were regarded as a data block.
+ */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,15 +64,14 @@ typedef char block_buf[BLOCK_SIZE];
 
 /*
  * Buffers are managed using a singly linked free list.
- * In each free block, the pointer to the next is in block->values[0].
- *
  * buf_count: number of used buffers. Useful for checking for leaked buffers.
  */
 struct btree {
     bt_value_or_addr_t file_size;
     int fd;
     int buf_count;
-    block_buf *next_free_block_buf;
+    int highest_buf_count;
+    block_buf *next_free_block_buf;  // start of the free block_buf list
     block_buf bufs[NUM_BUFS];
 };
 
@@ -61,8 +94,6 @@ struct node {
 //                BTree Basic Operations
 ////////////////////////////////////////////////////////////
 
-int highest_buf_count = 0;
-
 /*
  * Returns a new block address and increases the file size.
  */
@@ -73,7 +104,10 @@ bt_value_or_addr_t bt_new_block_addr(struct btree *bt) {
 }
 
 /*
- * You must free the returned buffer.
+ * ALLOCATES A BLOCK_BUF
+ *
+ * The free block_bufs are arranged in a singly linked list, with the pointer
+ * to the next free block_buf at the beginning of the block_buf.
  */
 void *bt_new_block_buf(struct btree *bt) {
     if (!bt->next_free_block_buf) {
@@ -81,11 +115,13 @@ void *bt_new_block_buf(struct btree *bt) {
         exit(1);
     }
     block_buf *buf = bt->next_free_block_buf;
+
+    // get the pointer stored at the beginning of the buf
     bt->next_free_block_buf = *(block_buf **)buf;
     bt->buf_count++;
 
-    if (bt->buf_count > highest_buf_count) {
-        highest_buf_count = bt->buf_count;
+    if (bt->buf_count > bt->highest_buf_count) {
+        bt->highest_buf_count = bt->buf_count;
     }
     return buf;
 }
@@ -96,14 +132,17 @@ void *bt_new_block_buf(struct btree *bt) {
  * of buffers in the btree, so make sure memory doesn't leak.
  */
 void bt_free_block_buf(struct btree *bt, void *buf) {
+    // assert buf is within the memory reserved for block_bufs
     assert(bt->bufs <= (block_buf *) buf && (block_buf *) buf < bt->bufs + NUM_BUFS);
+
+    // store pointer to the previous head of free list in beginning of buf
     *(block_buf **)buf = bt->next_free_block_buf;
     bt->next_free_block_buf = buf;
     bt->buf_count--;
 }
 
 /*
- * You must free the returned buffer.
+ * ALLOCATES A BLOCK_BUF
  */
 struct node *bt_read_node(struct btree *bt, bt_value_or_addr_t addr) {
     assert(addr < bt->file_size && addr % BLOCK_SIZE == 0);
@@ -143,14 +182,14 @@ void bt_write_node(struct btree *bt, struct node *node, bt_value_or_addr_t addr)
 }
 
 /*
- * You must free the returned buffer.
+ * ALLOCATES A BLOCK_BUF
  */
 struct header *bt_get_header(struct btree *bt) {
     return (struct header *) bt_read_node(bt, 0);
 }
 
 /*
- * You must free the returned buffer.
+ * ALLOCATES A BLOCK_BUF
  */
 struct node *bt_new_node(struct btree *bt, bt_value_or_addr_t *outparam_node_addr) {
     struct header *header = bt_get_header(bt);
@@ -164,6 +203,8 @@ struct node *bt_new_node(struct btree *bt, bt_value_or_addr_t *outparam_node_add
     } else {
         struct node *node = bt_read_node(bt, free_ptr);
         assert(node->nkeys == INVALID_NKEYS);
+
+        // pointer to next free is at values[0]
         bt_value_or_addr_t next_free = node->values[0];
         header->free_ptr = next_free;
         bt_write_node(bt, (struct node *) header, 0);
@@ -177,8 +218,9 @@ struct node *bt_new_node(struct btree *bt, bt_value_or_addr_t *outparam_node_add
 void bt_free_node(struct btree *bt, bt_value_or_addr_t node_addr) {
     struct header *header = bt_get_header(bt);
     bt_value_or_addr_t free_ptr = header->free_ptr;
-
     struct node *free_block = bt_new_block_buf(bt);
+
+    // pointer to next free is at values[0]
     free_block->values[0] = free_ptr;
     header->free_ptr = node_addr;
 
@@ -189,7 +231,7 @@ void bt_free_node(struct btree *bt, bt_value_or_addr_t node_addr) {
 }
 
 /*
- * You must free the returned buffer.
+ * ALLOCATES A BLOCK_BUF
  */
 struct node *bt_get_root(struct btree *bt, bt_value_or_addr_t *outparam_root_addr) {
     struct header *header = bt_get_header(bt);
@@ -232,6 +274,7 @@ void bt_open(struct btree *bt, const char *filename) {
     }
     *(char **) &bt->bufs[NUM_BUFS - 1] = NULL;
     bt->buf_count = 0;
+    bt->highest_buf_count = 0;
 
     // if file is empty
     if (bt->file_size == 0) {
@@ -469,7 +512,7 @@ struct insert_recurse_result {
 };
 
 /*
- * This function fully takes care of setting the fields in result.
+ * This function fully takes care of setting the fields in outparam.
  */
 void bt_insert_leaf(
     struct btree *bt,
@@ -516,7 +559,7 @@ void bt_insert_leaf(
 }
 
 /*
- * This function fully takes care of setting the fields in result.
+ * This function fully takes care of setting the fields in outparam.
  *
  * @param i: index within node values of the child that was just split.
  * @param new_key: new key to be inserted between new_child and the child
@@ -716,7 +759,7 @@ void array_merge_append(uint64_t *src, int src_len, uint64_t *dest, int dest_len
 
 /*
  * sibling is never null.
- * You must free the returned buffer.
+ * NOTE: This struct contains an allocated block_buf. Remember to free it.
  */
 struct delete_get_sibling {
     struct node *sibling;
@@ -725,6 +768,8 @@ struct delete_get_sibling {
 };
 
 /*
+ * ALLOCATES A BLOCK_BUF
+ *
  * Returns a sibling suitable for taking from during the delete algorithm.
  *
  * Returns a sibling with nkeys > min_nkeys if one exists, or if not,
@@ -832,6 +877,7 @@ struct delete_recurse_result {
  * @param parent: parent of leaf
  * @param p_ind: index within parent of leaf.
  * @param i: index within leaf of element to delete.
+ * @param outparam: this function fully takes care of setting the fields in outparam.
  */
 void bt_delete_leaf(
     struct btree *bt,
@@ -857,7 +903,7 @@ void bt_delete_leaf(
     bt_delete_get_sibling(bt, MIN_NKEYS_LEAF, parent, parent_index, &sibling_result);
     struct node *sibling = sibling_result.sibling;  // a shortened alias
 
-    if (sibling_result.sibling->nkeys > MIN_NKEYS_LEAF) {
+    if (sibling->nkeys > MIN_NKEYS_LEAF) {
         if (sibling_result.is_left_sib) {
             // move left sib's rightmost key-value to leaf
             // steps:
@@ -953,6 +999,9 @@ void bt_delete_leaf(
     }
 }
 
+/*
+ * This function fully takes care of setting the fields in outparam.
+ */
 void bt_delete_intnode(
     struct btree *bt,
     struct node *intnode,
@@ -1333,7 +1382,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char* argv[])
     int value = bt_lookup(&bt, 42, &success);
     printf("lookup %s. value = %i\n", success ? "success" : "failure", value);
     printf("leaked buffers: %i\n", bt.buf_count);
-    printf("highest buf count: %i\n", highest_buf_count);
+    printf("highest buf count: %i\n", bt.highest_buf_count);
     bt_close(&bt);
     return 0;
 }

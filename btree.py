@@ -24,10 +24,10 @@ import os
 import io
 import struct
 
-from disk import BlockCache, DiskBlock, iotrace, BLOCK_SIZE
+import disk
 
-MAX_NKEYS = (BLOCK_SIZE - 16) // 16
-CACHE_SIZE = 8192
+MAX_NKEYS = (disk.BLOCK_SIZE - 16) // 16
+CACHE_SIZE = 0
 
 OFFSET_ROOT_PTR = 0
 OFFSET_FREE_PTR = 8
@@ -118,7 +118,7 @@ class NodeFile:
 
         st = os.fstat(self.f.fileno())
         self.file_size = st.st_size
-        self.bcache = BlockCache(self.f, CACHE_SIZE)
+        self.bcache = disk.BlockCache(self.f, CACHE_SIZE)
         if self.file_size == 0:
             self._init_file()
 
@@ -136,7 +136,7 @@ class NodeFile:
         root_addr = self._extend_file()
 
         # set root pointer to a new root. free list pointer = null.
-        header = DiskBlock(0)
+        header = disk.DiskBlock(0)
         pack(UINT64, header.buf, OFFSET_ROOT_PTR, root_addr)
         pack(UINT64, header.buf, OFFSET_FREE_PTR, 0)
         self.bcache.write(header)
@@ -150,7 +150,7 @@ class NodeFile:
     def _extend_file(self):
         """Creates a new block. Returns its address."""
         old_size = self.file_size
-        self.file_size += BLOCK_SIZE
+        self.file_size += disk.BLOCK_SIZE
         return old_size
 
     def new_node(self):
@@ -159,7 +159,7 @@ class NodeFile:
         free_ptr = unpack(UINT64, header.buf, OFFSET_FREE_PTR)
         if free_ptr == 0:
             addr = self._extend_file()
-            block = DiskBlock(addr)
+            block = disk.DiskBlock(addr)
             return NodeBuf(block)
         else:
             block = self.bcache.read(free_ptr)
@@ -203,8 +203,8 @@ class NodeFile:
         next_leaf_ptrs = {}
         child_ptrs = {}
 
-        iotrace.scope()
-        for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
+        disk.iotrace.scope()
+        for addr in range(disk.BLOCK_SIZE, self.file_size, disk.BLOCK_SIZE):
             node = self.node_at(addr)
             if node.get_nkeys() == INVALID_NKEYS:
                 next_free = unpack(UINT64, node.block.buf, OFFSET_NEXT_FREE)
@@ -254,18 +254,18 @@ class NodeFile:
 
         # test completeness of free list and tree blocks
         free_blocks = set(free_list_ptrs)
-        all_blocks = set(range(BLOCK_SIZE, self.file_size, BLOCK_SIZE))
+        all_blocks = set(range(disk.BLOCK_SIZE, self.file_size, disk.BLOCK_SIZE))
         orphan_blocks = all_blocks - (free_blocks | tree_blocks)
         assert len(free_blocks & tree_blocks) == 0
         assert len(orphan_blocks) == 0, \
             f"{len(orphan_blocks)} orphan blocks: {orphan_blocks}"
 
-        iotrace.pop()
+        disk.iotrace.pop()
 
     def print(self):
         freelist = []
-        iotrace.scope()
-        for addr in range(BLOCK_SIZE, self.file_size, BLOCK_SIZE):
+        disk.iotrace.scope()
+        for addr in range(disk.BLOCK_SIZE, self.file_size, disk.BLOCK_SIZE):
             node = self.node_at(addr)
             if node.get_nkeys() == INVALID_NKEYS:
                 next_free = unpack(UINT64, node.block.buf, OFFSET_NEXT_FREE)
@@ -278,7 +278,7 @@ class NodeFile:
 
         for addr, next_free in freelist:
             print(f"{addr} -> {next_free}")
-        iotrace.pop()
+        disk.iotrace.pop()
 
 
 class NodeBuf:
